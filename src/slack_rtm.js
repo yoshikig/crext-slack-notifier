@@ -147,18 +147,32 @@ class SlackRtm {
     async #updateConfigs() {
       // https://github.com/ErikKalkoken/slackApiDoc/blob/master/users.prefs.get.md
       const json = await send('users.prefs.get');
+      const mutedChannels = [];
       if (json.ok && json.prefs) {
-        const allMutedChannels = json.prefs.muted_channels || '';
-        this.#mutedChannelsChanged(allMutedChannels);
+        const allMutedChannelStr = json.prefs.muted_channels || '';
+        const allMutedChannels = allMutedChannelStr.split(',').filter(c => c.length > 0);
+        mutedChannels.push(...allMutedChannels);
 
-        console.log('user prefs updated');
+        const allNotificationPrefsJson = json.prefs.all_notifications_prefs;
+        if (allNotificationPrefsJson) {
+          const allNotificationPrefs = JSON.parse(allNotificationPrefsJson);
+          if (allNotificationPrefs.channels) {
+            const channels = allNotificationPrefs.channels;
+            const allMutedChannels2 = Object.fromEntries(Object.entries(channels).filter(([k,v]) => v.muted));
+            mutedChannels.push(...Object.keys(allMutedChannels2));
+          }
+        }
+
+        this.#mutedChannelsChanged(mutedChannels);
+
+        console.log('muted channels updated:', mutedChannels);
       } else {
         console.error('users.prefs.get failed', json);
       }
     }
 
     #mutedChannelsChanged(allMutedChannels) {
-      this.mutedChannels = allMutedChannels.split(',').filter(c => c.length > 0);
+      this.mutedChannels = allMutedChannels;
 
       let updated = false;
       for (const channelId of this.mutedChannels) {
