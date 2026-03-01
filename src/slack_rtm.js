@@ -1,6 +1,5 @@
 import { send } from "./slack_api.js";
 
-var kPeriodicalUpdateAlarmName = 'PERIODICAL';
 let theInstance = null;
 
 class SlackRtm {
@@ -16,6 +15,7 @@ class SlackRtm {
       this.mutedChannels = [];
       this.socket = null;
       this.webSocketId = 0;
+      this.keepAliveIntervalId = null;
     }
 
     addListener(listener) {
@@ -45,11 +45,16 @@ class SlackRtm {
     }
 
     forceUpdate() {
-      this.updateUnreadCount();
+      this.#updateUnreadCount();
     }
 
     #startKeepAlive() {
-      chrome.alarms.create(kPeriodicalUpdateAlarmName, { periodInMinutes: 0.5 });
+      if (this.keepAliveIntervalId) {
+        clearInterval(this.keepAliveIntervalId);
+      }
+      this.keepAliveIntervalId = setInterval(() => {
+        this.sendPing();
+      }, 20 * 1000);
     }
 
     #updateUnreadCount() {
@@ -125,6 +130,10 @@ class SlackRtm {
       });
       this.socket.onclose = ((e) => {
         console.info('websocket close');
+        if (this.keepAliveIntervalId) {
+          clearInterval(this.keepAliveIntervalId);
+          this.keepAliveIntervalId = null;
+        }
         this.#startWebSocket();
       });
     }
@@ -139,7 +148,7 @@ class SlackRtm {
       // https://github.com/ErikKalkoken/slackApiDoc/blob/master/users.prefs.get.md
       const json = await send('users.prefs.get');
       if (json.ok && json.prefs) {
-        const allMutedChannels = json.prefs.muted_channels;
+        const allMutedChannels = json.prefs.muted_channels || '';
         this.#mutedChannelsChanged(allMutedChannels);
 
         console.log('user prefs updated');
@@ -165,14 +174,6 @@ class SlackRtm {
       }
     }
 }
-
-chrome.alarms.onAlarm.addListener(alarm => {
-  switch (alarm.name) {
-    case kPeriodicalUpdateAlarmName:
-      theInstance.sendPing();
-      break;
-  }
-});
 
 // Singleton instance
 const slackInstance = Object.seal(new SlackRtm());
