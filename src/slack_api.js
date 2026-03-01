@@ -53,12 +53,3 @@ function sendInternal(api, args) {
     return json;
   });
 }
-
-chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName != 'sync')
-    return;
-
-  if (changes.token && changes.token.newValue != g.token) {
-    clearGlobalValues();
-  }
-});

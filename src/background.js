@@ -13,6 +13,15 @@ function clearGlobalValues() {
   g.updatedTimestamps = {}
 }
 
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName != 'sync')
+    return;
+
+  if (changes.token && changes.token.newValue != g.token) {
+    clearGlobalValues();
+  }
+});
+
 async function isUnread() {
   const json = await send('conversations.list');
   console.debug(json);
