@@ -9,6 +9,7 @@ Object.seal(g);
 
 function clearGlobalValues() {
   g.teamInfo = null;
+  g.teamInfoRequest = null;
   g.iconImageBitmap = null;
   g.updatedTimestamps = {}
 }
@@ -17,8 +18,9 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName != 'sync')
     return;
 
-  if (changes.token && changes.token.newValue != g.token) {
+  if (changes.token) {
     clearGlobalValues();
+    keepWorkerAliveDuringSync(gSlackUnreadClient.restart());
   }
 });
 
@@ -78,11 +80,17 @@ function glayize(data) {
 function getTeamInfo() {
   if (g.teamInfo)
     return Promise.resolve(g.teamInfo);
+  if (g.teamInfoRequest)
+    return g.teamInfoRequest;
 
-  return send('team.info').then(json => {
-    g.teamInfo = json.team;
+  const request = send('team.info').then(json => {
+    if (g.teamInfoRequest === request) g.teamInfo = json.team;
     return json.team;
+  }).finally(() => {
+    if (g.teamInfoRequest === request) g.teamInfoRequest = null;
   });
+  g.teamInfoRequest = request;
+  return request;
 }
 
 async function getIconImageBitmap() {
@@ -90,8 +98,8 @@ async function getIconImageBitmap() {
     return g.iconImageBitmap;
 
   const teamInfo = await getTeamInfo();
-  console.log(teamInfo.icon.image_132);
-  const imageBlob = await (await fetch(teamInfo.icon.image_132)).blob();
+  const iconUrl = teamInfo?.icon?.image_132 || teamInfo?.icon?.image_102 || 'slack.png';
+  const imageBlob = await (await fetch(iconUrl)).blob();
   const bitmap = await self.createImageBitmap(imageBlob);
   g.iconImageBitmap = bitmap;
   return bitmap;
@@ -108,11 +116,13 @@ async function setIcon(isGray) {
   if (isGray)
     glayize(imageData);
 
-  chrome.action.setIcon({imageData: imageData});
+  await chrome.action.setIcon({imageData: imageData});
 }
 
 function updateUnreadCount(unreadCount, mentionCount) {
-  setIcon(unreadCount == 0 && mentionCount == 0);
+  setIcon(unreadCount == 0 && mentionCount == 0).catch(error => {
+    console.error('Failed to update Slack icon', error);
+  });
   if (mentionCount > 0) {
     chrome.action.setBadgeText({text: mentionCount.toString()});
     chrome.action.setBadgeBackgroundColor({color: '#d00'});
@@ -156,43 +166,42 @@ chrome.action.onClicked.addListener(async () => {
   chrome.tabs.create({ url: url }, () => {});
 });
 
-self.addEventListener("install", function() {
-  console.log('ServiceWorker installed');
-  //gSlackUnreadClient.initialize();
-  //gSlackUnreadClient.addListener(updateUnreadCount);
-  //gSlackUnreadClient.start();
+// Register on every service-worker start, including wake-up from suspension.
+function keepWorkerAliveDuringSync(promise) {
+  // A large paginated HTTP sync can outlast the worker's idle timeout.
+  const timer = setInterval(() => chrome.runtime.getPlatformInfo().catch(() => {}), 20000);
+  return Promise.resolve(promise).finally(() => clearInterval(timer));
+}
+
+chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name === 'refresh-unread-counts') keepWorkerAliveDuringSync(gSlackUnreadClient.refresh());
+});
+function setHttpSyncAlarm(policy) {
+  chrome.alarms.create('refresh-unread-counts', { periodInMinutes: policy.intervalMinutes });
+}
+gSlackUnreadClient.addSyncPolicyListener(setHttpSyncAlarm);
+setHttpSyncAlarm(gSlackUnreadClient.getSyncPolicy());
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (sender.id === chrome.runtime.id && message?.type === 'getSyncDiagnostics') {
+    sendResponse(gSlackUnreadClient.getDiagnostics());
+  }
+  if (sender.id === chrome.runtime.id && message?.type === 'refreshUnreadCounts') {
+    keepWorkerAliveDuringSync(gSlackUnreadClient.refresh()).then(() => sendResponse(gSlackUnreadClient.getDiagnostics()));
+    return true;
+  }
+  if (sender.id === chrome.runtime.id && message?.type === 'getWorkspaceInfo') {
+    getTeamInfo().then(team => {
+      sendResponse({ workspace: {
+        id: team.id, name: team.name, domain: team.domain,
+        iconUrl: team.icon?.image_132 || team.icon?.image_102 || team.icon?.image_88 || team.icon?.image_68 || null
+      } });
+    }).catch(() => sendResponse({ error: 'ワークスペース情報を取得できませんでした。Tokenや取得権限を確認してください。' }));
+    return true;
+  }
 });
 
-self.addEventListener("activate", function() {
-  console.log('ServiceWorker activate');
-  setIcon(false);
-  gSlackUnreadClient.initialize();
-  gSlackUnreadClient.addListener(updateUnreadCount);
-  gSlackUnreadClient.start();
-});
-
-chrome.runtime.onInstalled.addListener(function() {
-  console.log('onInstalled');
-  //gSlackUnreadClient.initialize();
-  //gSlackUnreadClient.addListener(updateUnreadCount);
-  //gSlackUnreadClient.start();
-});
-
-chrome.runtime.onStartup.addListener(function() {
-  console.log('onStartup');
-  gSlackUnreadClient.initialize();
-  gSlackUnreadClient.addListener(updateUnreadCount);
-  gSlackUnreadClient.start();
-});
-
-chrome.runtime.onSuspend.addListener(() => {
-  console.log('suspend');
-  chrome.runtime.getBackgroundPage(() => {});
-});
-
-chrome.runtime.onSuspendCanceled.addListener(() => {
-  console.log('suspend canceled');
-});
-
+gSlackUnreadClient.addListener(updateUnreadCount);
+gSlackUnreadClient.initialize();
+keepWorkerAliveDuringSync(gSlackUnreadClient.start());
 
 console.log('background.js loaded');

@@ -1,17 +1,62 @@
 <!DOCTYPE html>
-<html>
-<head><title>Slack Watcher Options</title></head>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Slack Watcher 設定</title>
+  <link rel="stylesheet" href="options.css">
+</head>
 <body>
-
-<label>
-  Token: 
-  <input type="text" id="token" name="token">
-</label>
-
-<button id="save">Save</button>
-
-<div id="status"></div>
-
+<main>
+  <h1>Slack Watcher 設定</h1>
+  <section>
+    <h2>認証</h2>
+    <label for="token">Token</label>
+    <input type="password" id="token" name="token" autocomplete="off">
+    <button id="save">保存</button>
+    <span id="status" role="status"></span>
+  </section>
+  <section>
+    <h2>連携先Slack</h2>
+    <p id="workspace-status" role="status">ワークスペース情報を取得中…</p>
+    <div id="workspace-info" hidden>
+      <div class="workspace-heading">
+        <img id="workspace-icon" src="slack.png" width="64" height="64" alt="ワークスペースのアイコン" referrerpolicy="no-referrer">
+        <strong id="workspace-name"></strong>
+      </div>
+      <dl>
+        <dt>ワークスペースID</dt><dd id="workspace-id"></dd>
+        <dt>ドメイン</dt><dd id="workspace-domain"></dd>
+        <dt>Slack URL</dt><dd><a id="workspace-url" target="_blank" rel="noopener noreferrer"></a></dd>
+      </dl>
+    </div>
+  </section>
+  <section>
+    <h2>同期ステータス</h2>
+    <button id="refresh-unreads">未読データを再取得</button>
+    <p class="note">2秒ごとに表示を更新します。履歴・内部データはバックグラウンドの起動後の情報です。</p>
+    <p id="diagnostics-error" role="status"></p>
+    <dl id="connection-status"></dl>
+  </section>
+  <section>
+    <h2>HTTP API 同期履歴（WebSocket以外）</h2>
+    <p class="note">最新30件。users.counts が利用できないTokenでは、参加チャンネル一覧・チャンネル情報・最終既読以降の履歴から未読数を取得します。</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>開始時刻</th><th>完了時刻</th><th>所要時間</th><th>API / 対象</th><th>結果</th><th>取得内容 / エラー</th></tr></thead>
+      <tbody id="sync-history"></tbody>
+    </table></div>
+  </section>
+  <section>
+    <h2>内部のチャンネルデータ</h2>
+    <p id="unread-totals"></p>
+    <label><input type="checkbox" id="unread-only" checked> 未読・メンションのあるチャンネルと未取得のチャンネルのみ</label>
+    <p class="note">合計はミュートを除外。未取得の値を0件として扱いません。名前を取得できない場合はIDを表示します。DMのメンション列は内部の dm_count です。最終既読時刻も返らないTokenでは、初期の未読数を取得できません。</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>チャンネル名</th><th>ID</th><th>未読数</th><th>メンション / DM数</th><th>ミュート</th><th>取得状況</th></tr></thead>
+      <tbody id="channel-data"></tbody>
+    </table></div>
+  </section>
+</main>
 <script src="options.js"></script>
 </body>
 </html>
