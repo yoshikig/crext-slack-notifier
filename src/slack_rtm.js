@@ -13,6 +13,15 @@ function isUnreadMessage(message) {
     (!message.thread_ts || message.thread_ts === message.ts || message.subtype === 'thread_broadcast');
 }
 
+function compareTs(a, b) {
+  const parse = value => {
+    const match = String(value ?? '').match(/^(\d+)(?:\.(\d{1,6}))?$/);
+    return match ? BigInt(match[1]) * 1000000n + BigInt((match[2] || '').padEnd(6, '0')) : null;
+  };
+  const left = parse(a), right = parse(b);
+  return left === null || right === null ? null : left < right ? -1 : left > right ? 1 : 0;
+}
+
 function timestampAfter(value) {
   const match = String(value).match(/^(\d+)(?:\.(\d{1,6}))?$/);
   if (!match) return null;
@@ -50,6 +59,11 @@ class SlackRtm {
       theInstance = this;
 
       this.listeners = [];
+      this.selfUserId = null;
+      this.messageLedger = new Map();
+      this.deletedChannels = new Set();
+      this.deletionSyncPromise = null;
+      this.currentRefreshChannel = null;
       this.unreadCounts = {};
       this.mentionCounts = {};
       this.mutedChannels = [];
@@ -81,10 +95,15 @@ class SlackRtm {
       this.successfulSyncsSinceConnection = 0;
       this.httpSyncIntervalMinutes = 5;
       this.syncPolicyListeners = [];
+      this.syncActivityListeners = [];
     }
 
     addListener(listener) {
         this.listeners.push(listener);
+    }
+
+    addSyncActivityListener(listener) {
+      this.syncActivityListeners.push(listener);
     }
 
     addSyncPolicyListener(listener) {
@@ -140,6 +159,7 @@ class SlackRtm {
         unreadCount: this.unreadCounts[id] ?? null,
         mentionCount: this.mentionCounts[id] ?? null,
         unreadCountExact: this.countDetails[id]?.unreadCountExact !== false,
+        mentionCountExact: this.countDetails[id]?.mentionCountExact !== false,
         countError: this.countDetails[id]?.error || '',
         muted: this.mutedChannels.includes(id)
       }));
@@ -163,7 +183,7 @@ class SlackRtm {
           unreadCount: sum.unreadCount + (c.unreadCount || 0),
           mentionCount: sum.mentionCount + (c.mentionCount || 0),
           unreadIncomplete: sum.unreadIncomplete || c.unreadCount === null || !c.unreadCountExact,
-          mentionIncomplete: sum.mentionIncomplete || c.mentionCount === null
+          mentionIncomplete: sum.mentionIncomplete || c.mentionCount === null || !c.mentionCountExact
         }), { unreadCount: 0, mentionCount: 0, unreadIncomplete: false, mentionIncomplete: false }),
         channels, syncHistory: getSyncHistory()
       };
@@ -198,6 +218,11 @@ class SlackRtm {
     }
 
     restart() {
+      this.selfUserId = null;
+      this.messageLedger.clear();
+      this.deletedChannels.clear();
+      this.deletionSyncPromise = null;
+      this.currentRefreshChannel = null;
       this.sessionId += 1;
       this.connectionGeneration += 1;
       this.successfulSyncsSinceConnection = 0;
@@ -274,8 +299,133 @@ class SlackRtm {
         json.type === 'message';
     }
 
-    #handleMessage(json, updateListeners = true) {
+    #markUncertain(channel, reason, unread = true) {
+      const detail = this.countDetails[channel] ||= {};
+      if (unread) detail.unreadCountExact = false;
+      detail.mentionCountExact = false;
+      detail.error = reason;
+      this.successfulSyncsSinceConnection = 0;
+      this.#updateSyncPolicy();
+    }
+
+    #contribution(message, channel) {
+      const detail = this.countDetails[channel] || {};
+      const direct = detail.isDirectMessage || message.channel_type === 'im' ||
+        message.channel_type === 'mpim' || channel.startsWith('D');
+      if (!isUnreadMessage({ ...message, type: 'message' }) ||
+          (this.selfUserId && message.user === this.selfUserId)) return { unread: 0, mention: 0 };
+      const text = (typeof message.text === 'string' ? message.text : '').replace(/\`\`\`[\s\S]*?\`\`\`|\`[^\`]*\`/g, '');
+      const richMentions = [];
+      let richBroadcast = false;
+      const visit = node => {
+        if (!node || typeof node !== 'object' || node.style?.code) return;
+        if (node.type === 'user' && typeof node.user_id === 'string') richMentions.push(node.user_id);
+        if (node.type === 'broadcast' || node.type === 'usergroup') richBroadcast = true;
+        if (node.type === 'rich_text_preformatted' || node.type === 'rich_text_inline_code') return;
+        for (const key of ['elements', 'blocks']) if (Array.isArray(node[key])) node[key].forEach(visit);
+      };
+      if (Array.isArray(message.blocks)) message.blocks.forEach(visit);
+      const mentions = [...text.matchAll(/<@([A-Z0-9]+)(?:\|[^>]*)?>/g)];
+      const unresolved = !direct && ((!this.selfUserId && (mentions.length > 0 || richMentions.length > 0)) ||
+        /<!subteam\^|<!(?:here|channel|everyone)(?:[>|])/.test(text) || richBroadcast);
+      return { unread: 1, mention: direct || mentions.some(match => match[1] === this.selfUserId) || richMentions.includes(this.selfUserId) ? 1 : 0,
+        unresolved };
+    }
+
+    #rememberMessage(channel, ts, entry) {
+      if (compareTs(ts, ts) === null) return;
+      this.messageLedger.set(channel + ':' + ts, { channel, ts, ...entry });
+      // Bound memory; an eventual deletion of an evicted message is marked uncertain.
+      if (this.messageLedger.size > 10000) this.messageLedger.delete(this.messageLedger.keys().next().value);
+    }
+
+    #changeCount(channel, field, delta) {
+      if (!delta) return;
+      const counts = field === 'unread' ? this.unreadCounts : this.mentionCounts;
+      if (typeof counts[channel] === 'number') counts[channel] = Math.max(0, counts[channel] + delta);
+      else if (delta > 0) {
+        counts[channel] = delta;
+        const detail = this.countDetails[channel] ||= {};
+        detail[field === 'unread' ? 'unreadCountExact' : 'mentionCountExact'] = false;
+      }
+    }
+
+    #applyMessageEvent(json, includedInSnapshot = false) {
+      const channel = json.channel;
+      const detail = this.countDetails[channel] ||= {};
+      if (json.channel_type === 'im' || json.channel_type === 'mpim') detail.isDirectMessage = true;
+      const deletion = json.subtype === 'message_deleted';
+      const edit = json.subtype === 'message_changed';
+      const message = edit ? json.message : json;
+      const ts = deletion ? json.deleted_ts : message?.ts;
+      if ((deletion || edit) && compareTs(ts, ts) === null) return false;
+      const key = channel + ':' + ts;
+      let previous = this.messageLedger.get(key);
+      if (previous?.deleted) return false;
+      if (deletion || edit) {
+        if (!previous && json.previous_message && compareTs(ts, detail.lastRead) !== null) {
+          const contribution = this.#contribution(json.previous_message, channel);
+          previous = { ...contribution, counted: compareTs(ts, detail.lastRead) > 0 };
+        }
+        if (!previous || previous.counted === null) {
+          // deleted_ts alone cannot tell whether the deleted item was unread or a mention.
+          if (compareTs(ts, detail.lastRead) !== null && compareTs(ts, detail.lastRead) <= 0) return false;
+          this.#markUncertain(channel, '編集・削除されたメッセージの元の未読状態が不明です');
+          if (deletion) this.#rememberMessage(channel, ts, { deleted: true, counted: false });
+          return true;
+        }
+        const next = deletion ? { unread: 0, mention: 0 } : this.#contribution(message, channel);
+        if (previous.counted) {
+          this.#changeCount(channel, 'unread', next.unread - previous.unread);
+          this.#changeCount(channel, 'mention', next.mention - previous.mention);
+        }
+        if (previous.unresolved || next.unresolved) this.#markUncertain(channel, '通知設定・ユーザーグループのメンション判定が未確定です', false);
+        this.#rememberMessage(channel, ts, { ...next, counted: previous.counted, deleted: deletion });
+        return true;
+      }
+      if (!isUnreadMessage(json) || previous) return false;
+      const contribution = this.#contribution(json, channel);
+      const alreadyRead = compareTs(ts, detail.lastRead) !== null && compareTs(ts, detail.lastRead) <= 0;
+      const snapshotIncludes = includedInSnapshot ||
+        (compareTs(ts, detail.snapshotLatest) !== null && compareTs(ts, detail.snapshotLatest) <= 0);
+      const counted = !alreadyRead && contribution.unread > 0;
+      if (counted && !snapshotIncludes) {
+        this.#changeCount(channel, 'unread', contribution.unread);
+        this.#changeCount(channel, 'mention', contribution.mention);
+      }
+      this.#rememberMessage(channel, ts, { ...contribution,
+        counted: snapshotIncludes && detail.lastRead == null ? null : counted });
+      if (contribution.unresolved) this.#markUncertain(channel, '通知設定・ユーザーグループのメンション判定が未確定です', false);
+      return counted;
+    }
+
+    #scheduleDeletionSync(channel) {
+      this.deletedChannels.add(channel);
+      if (this.deletionSyncPromise) return;
+      const sessionId = this.sessionId;
+      const promise = Promise.resolve().then(async () => {
+        while (sessionId === this.sessionId && this.deletedChannels.size) {
+          while (sessionId === this.sessionId && this.unreadRefreshPromise) await this.unreadRefreshPromise;
+          if (sessionId !== this.sessionId) return;
+          const channel = this.deletedChannels.values().next().value;
+          if (!channel) return;
+          this.deletedChannels.delete(channel);
+          await this.#refreshUnreadCounts(channel);
+        }
+      }).catch(error => console.error('Deletion HTTP sync failed', error)).finally(() => {
+        if (this.deletionSyncPromise === promise) {
+          this.deletionSyncPromise = null;
+          const next = this.deletedChannels.values().next().value;
+          if (next) this.#scheduleDeletionSync(next);
+        }
+      });
+      this.deletionSyncPromise = promise;
+    }
+
+    #handleMessage(json, updateListeners = true, scheduleDeletion = true) {
       if (this.#isCountEvent(json) && typeof json.channel !== 'string') return;
+      if (scheduleDeletion && json.type === 'message' && json.subtype === 'message_deleted' &&
+          compareTs(json.deleted_ts, json.deleted_ts) !== null) this.#scheduleDeletionSync(json.channel);
       if (this.isRefreshingUnreadCounts && this.#isCountEvent(json)) {
         this.pendingCountEvents.push(json);
         return;
@@ -286,26 +436,26 @@ class SlackRtm {
         console.log(json);
         this.unreadCounts[json.channel] = numericCount(json.unread_count_display, json.unread_count);
         this.mentionCounts[json.channel] = numericCount(json.mention_count_display, json.mention_count);
-        this.countDetails[json.channel] = { unreadCountExact: true };
+        this.countDetails[json.channel] = { ...this.countDetails[json.channel], unreadCountExact: true,
+          mentionCountExact: true, error: '', lastRead: json.ts || this.countDetails[json.channel]?.lastRead };
+        for (const entry of this.messageLedger.values()) {
+          if (entry.channel === json.channel && compareTs(entry.ts, json.ts) !== null &&
+              compareTs(entry.ts, json.ts) <= 0) entry.counted = false;
+        }
         countChanged = true;
       } else if (json.type === 'im_marked') {
         console.log(json);
         this.unreadCounts[json.channel] = numericCount(json.unread_count_display, json.unread_count, json.dm_count);
         this.mentionCounts[json.channel] = numericCount(json.dm_count, json.mention_count_display, json.mention_count);
-        this.countDetails[json.channel] = { unreadCountExact: true };
-        countChanged = true;
-      } else if (json.type === 'message') {
-        if (!isUnreadMessage(json)) return;
-        console.log(json);
-        if (typeof this.unreadCounts[json.channel] === 'number') {
-          // If the channel already exists, increment the count
-          this.unreadCounts[json.channel] += 1;
-        } else {
-          // If the channel doesn't exist, create it
-          this.unreadCounts[json.channel] = 1;
-          this.countDetails[json.channel] = { unreadCountExact: false };
+        this.countDetails[json.channel] = { ...this.countDetails[json.channel], unreadCountExact: true,
+          mentionCountExact: true, error: '', lastRead: json.ts || this.countDetails[json.channel]?.lastRead };
+        for (const entry of this.messageLedger.values()) {
+          if (entry.channel === json.channel && compareTs(entry.ts, json.ts) !== null &&
+              compareTs(entry.ts, json.ts) <= 0) entry.counted = false;
         }
         countChanged = true;
+      } else if (json.type === 'message') {
+        countChanged = this.#applyMessageEvent(json);
       } else if (json.type === 'pref_change') {
         if (json.name === 'all_notifications_prefs') {
           const json2 = notificationPrefs(json.value);
@@ -325,25 +475,46 @@ class SlackRtm {
       }
     }
 
-    #refreshUnreadCounts() {
-      if (this.unreadRefreshPromise) return this.unreadRefreshPromise;
-      const promise = this.#performUnreadRefresh().finally(() => {
-        if (this.unreadRefreshPromise === promise) this.unreadRefreshPromise = null;
+    #refreshUnreadCounts(channel = null) {
+      if (this.unreadRefreshPromise) {
+        if (channel === null && this.currentRefreshChannel !== null) {
+          return this.unreadRefreshPromise.then(() => this.#refreshUnreadCounts());
+        }
+        return this.unreadRefreshPromise;
+      }
+      this.currentRefreshChannel = channel;
+      const promise = this.#performUnreadRefresh(channel).finally(() => {
+        if (this.unreadRefreshPromise === promise) {
+          this.unreadRefreshPromise = null;
+          this.currentRefreshChannel = null;
+        }
       });
       this.unreadRefreshPromise = promise;
+      for (const listener of this.syncActivityListeners) {
+        try { listener(promise); } catch (error) { console.error('HTTP sync listener failed', error); }
+      }
       return promise;
     }
 
-    async #performUnreadRefresh() {
+    async #performUnreadRefresh(targetChannel = null) {
       const refreshId = ++this.unreadRefreshId;
       const connectionGeneration = this.socket?.readyState === WebSocket.OPEN ? this.connectionGeneration : null;
       this.isRefreshingUnreadCounts = true;
       this.pendingCountEvents = [];
-      this.lastUnreadSync = { startedAt: Date.now(), finishedAt: null, status: 'running', source: this.countsMethod, error: '', warning: '' };
+      this.lastUnreadSync = { startedAt: Date.now(), finishedAt: null, status: 'running', source: targetChannel ? 'conversations.info' : this.countsMethod, targetChannel, reason: targetChannel ? 'message_deleted' : 'periodic/manual', error: '', warning: '' };
 
       try {
         let json;
-        if (this.countsMethod === 'users.counts') {
+        if (targetChannel) {
+          const result = await send('conversations.info', { channel: targetChannel, include_num_members: false });
+          if (refreshId !== this.unreadRefreshId) return;
+          if (!result.channel || result.channel.id !== targetChannel) throw new Error('対象チャンネル情報が応答にありません');
+          const info = { ...result.channel,
+            is_im: result.channel.is_im || targetChannel.startsWith('D'),
+            is_mpim: result.channel.is_mpim || (this.countDetails[targetChannel]?.isDirectMessage && !targetChannel.startsWith('D')) };
+          const warning = await this.#completeConversationCount(info, refreshId);
+          json = { channels: [info], warning };
+        } else if (this.countsMethod === 'users.counts') {
           try {
             json = await send('users.counts');
           } catch (error) {
@@ -358,10 +529,10 @@ class SlackRtm {
         if (!['channels', 'groups', 'ims', 'mpims'].some(key => Array.isArray(json[key]))) {
           throw new Error('未読データが応答に含まれていません');
         }
-        const unreadCounts = {};
-        const mentionCounts = {};
-        const countDetails = {};
-        const entries = [...(json.channels || []), ...(json.groups || []), ...(json.mpims || []),
+        const unreadCounts = targetChannel ? { ...this.unreadCounts } : {};
+        const mentionCounts = targetChannel ? { ...this.mentionCounts } : {};
+        const countDetails = targetChannel ? { ...this.countDetails } : {};
+        const entries = [...(json.channels || []), ...(json.groups || []), ...(json.mpims || []).map(im => ({ ...im, is_mpim: true })),
           ...(json.ims || []).map(im => ({ ...im, is_im: true }))];
 
         for (const channel of entries) {
@@ -376,7 +547,9 @@ class SlackRtm {
           mentionCounts[channel.id] = numericCount(channel.mention_count_display, channel.mention_count, channel.is_im ? channel.dm_count : null);
           const latest = typeof channel.latest === 'object' ? channel.latest?.ts : channel.latest;
           countDetails[channel.id] = { unreadCountExact: exact, error: channel.countError || '',
-            snapshotLatest: channel.snapshotLatest || latest || null };
+            snapshotLatest: channel.snapshotLatest || latest || null,
+            lastRead: compareTs(channel.last_read, channel.last_read) !== null ? channel.last_read : null,
+            isDirectMessage: Boolean(channel.is_im || channel.is_mpim) };
           if (unread === null) countDetails[channel.id].error ||= 'このTokenでは未読数・最終既読時刻が取得できません';
         }
 
@@ -384,16 +557,24 @@ class SlackRtm {
           this.unreadCounts = unreadCounts;
           this.mentionCounts = mentionCounts;
           this.countDetails = countDetails;
+          for (const entry of this.messageLedger.values()) {
+            const detail = countDetails[entry.channel];
+            if (!detail || entry.deleted) continue;
+            const read = compareTs(entry.ts, detail.lastRead);
+            const included = compareTs(entry.ts, detail.snapshotLatest);
+            entry.counted = read !== null ? read > 0 && entry.unread > 0 : included !== null && included <= 0 ? null : entry.counted;
+          }
           for (const channel of entries) {
             if (channel.name) this.channelNames[channel.id] = channel.name;
           }
-          this.lastUnreadSync.source = this.countsMethod;
+          this.lastUnreadSync.source = targetChannel ? 'conversations.info' : this.countsMethod;
           const unknown = Object.values(unreadCounts).filter(value => value === null).length;
           this.lastUnreadSync.status = unknown || json.warning ? 'partial' : 'success';
           this.lastUnreadSync.warning = [json.warning, unknown ? `${unknown}チャンネルの未読数が未取得です。Tokenの種類・権限を確認してください。` : ''].filter(Boolean).join(' / ');
         }
       } catch (e) {
         if (refreshId === this.unreadRefreshId) {
+          if (targetChannel) this.#markUncertain(targetChannel, '削除後のHTTP再取得に失敗しました');
           this.lastUnreadSync.status = 'error';
           this.lastUnreadSync.error = typeof e === 'string' ? e : e.message || '通信エラー';
         }
@@ -411,11 +592,15 @@ class SlackRtm {
         for (const event of pendingCountEvents) {
           // A channel snapshot may already include messages received during HTTP sync.
           const snapshotLatest = this.countDetails[event.channel]?.snapshotLatest;
-          if (event.type === 'message' && !markedChannels.has(event.channel) && snapshotLatest &&
-              event.ts && Number(event.ts) <= Number(snapshotLatest)) continue;
-          this.#handleMessage(event, false);
+          if (event.type === 'message' && isUnreadMessage(event) && !markedChannels.has(event.channel) && snapshotLatest &&
+              compareTs(event.event_ts || event.ts, snapshotLatest) !== null &&
+              compareTs(event.event_ts || event.ts, snapshotLatest) <= 0) {
+            this.#applyMessageEvent(event, true);
+            continue;
+          }
+          this.#handleMessage(event, false, false);
         }
-        if (connectionGeneration !== null && connectionGeneration === this.connectionGeneration &&
+        if (!targetChannel && connectionGeneration !== null && connectionGeneration === this.connectionGeneration &&
             this.socket?.readyState === WebSocket.OPEN) {
           const complete = this.lastUnreadSync.status === 'success' &&
             Object.values(this.countDetails).every(detail => detail.unreadCountExact && !detail.error);
@@ -439,7 +624,7 @@ class SlackRtm {
             const page = await send('users.conversations', { types: type, exclude_archived: true, limit: 200, cursor });
             if (!Array.isArray(page.channels)) throw new Error('チャンネル一覧が応答にありません');
             for (const channel of page.channels) {
-              if (channel.id && !channel.is_archived) channels.set(channel.id, { ...channel, is_im: type === 'im' || channel.is_im });
+              if (channel.id && !channel.is_archived) channels.set(channel.id, { ...channel, is_im: type === 'im' || channel.is_im, is_mpim: type === 'mpim' || Boolean(channel.is_mpim) });
             }
             cursor = typeof page.response_metadata?.next_cursor === 'string' ? page.response_metadata.next_cursor.trim() : '';
             if (cursor && seenCursors.has(cursor)) throw new Error('チャンネル一覧のページ取得が進みません');
@@ -462,23 +647,8 @@ class SlackRtm {
             if (!json.channel) throw new Error('チャンネル情報が応答にありません');
             info = { ...channel, ...json.channel };
           }
-          if (numericCount(info.unread_count_display, info.unread_count, info.is_im ? info.dm_count : null) === null &&
-              typeof info.has_unreads !== 'boolean' && /^\d+(\.\d+)?$/.test(String(info.last_read ?? ''))) {
-            const latest = typeof info.latest === 'object' ? info.latest?.ts : info.latest;
-            if (latest != null && Number(latest) <= Number(info.last_read)) info.unread_count = 0;
-            else {
-              const history = await this.#countHistorySinceRead(id, info.last_read, refreshId, latest);
-              if (history) {
-                info.unread_count = history.count;
-                info.snapshotLatest = history.snapshotLatest;
-                info.unreadCountExact = history.exact;
-                if (!history.exact) {
-                  info.countError = '履歴取得上限（5ページ）に達したため、未読数は下限値です';
-                  warnings.push(`${id}: 履歴取得上限に到達（未読${history.count}件以上）`);
-                }
-              }
-            }
-          }
+          const warning = await this.#completeConversationCount(info, refreshId);
+          if (warning) warnings.push(warning);
         } catch (error) {
           if (/ratelimited|invalid_auth|token_revoked|token_expired/.test(String(error))) throw error;
           info.countError = typeof error === 'string' ? error : error.message;
@@ -488,6 +658,26 @@ class SlackRtm {
         if (refreshId === this.unreadRefreshId) this.lastUnreadSync.progress = `${completed} / ${channels.size}チャンネル`;
       }
       return { channels: [...channels.values()], warning: warnings.join(' / ') };
+    }
+
+    async #completeConversationCount(info, refreshId) {
+      if (numericCount(info.unread_count_display, info.unread_count, info.is_im ? info.dm_count : null) !== null ||
+          typeof info.has_unreads === 'boolean' || compareTs(info.last_read, info.last_read) === null) return '';
+      const latest = typeof info.latest === 'object' ? info.latest?.ts : info.latest;
+      if (compareTs(latest, info.last_read) !== null && compareTs(latest, info.last_read) <= 0) info.unread_count = 0;
+      else {
+        const history = await this.#countHistorySinceRead(info.id, info.last_read, refreshId, latest);
+        if (history) {
+          info.unread_count = history.count;
+          info.snapshotLatest = history.snapshotLatest;
+          info.unreadCountExact = history.exact;
+          if (!history.exact) {
+            info.countError = '履歴取得上限（5ページ）に達したため、未読数は下限値です';
+            return `${info.id}: 履歴取得上限に到達（未読${history.count}件以上）`;
+          }
+        }
+      }
+      return '';
     }
 
     async #countHistorySinceRead(channel, lastRead, refreshId, snapshotLatest) {
@@ -547,6 +737,7 @@ class SlackRtm {
       try {
         const json = await send('rtm.connect');
         if (sessionId !== this.sessionId) return;
+        this.selfUserId = typeof json.self?.id === 'string' ? json.self.id : null;
         socket = new WebSocket(json.url);
         this.socket = socket;
       } catch (e) {
