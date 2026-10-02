@@ -318,7 +318,7 @@ class SlackRtm {
       const richMentions = [];
       let richBroadcast = false;
       const visit = node => {
-        if (!node || typeof node !== 'object') return;
+        if (!node || typeof node !== 'object' || node.style?.code) return;
         if (node.type === 'user' && typeof node.user_id === 'string') richMentions.push(node.user_id);
         if (node.type === 'broadcast' || node.type === 'usergroup') richBroadcast = true;
         if (node.type === 'rich_text_preformatted' || node.type === 'rich_text_inline_code') return;
@@ -375,7 +375,7 @@ class SlackRtm {
           return true;
         }
         const next = deletion ? { unread: 0, mention: 0 } : this.#contribution(message, channel);
-        if (previous.counted && !includedInSnapshot) {
+        if (previous.counted) {
           this.#changeCount(channel, 'unread', next.unread - previous.unread);
           this.#changeCount(channel, 'mention', next.mention - previous.mention);
         }
@@ -484,7 +484,10 @@ class SlackRtm {
       }
       this.currentRefreshChannel = channel;
       const promise = this.#performUnreadRefresh(channel).finally(() => {
-        if (this.unreadRefreshPromise === promise) this.unreadRefreshPromise = null;
+        if (this.unreadRefreshPromise === promise) {
+          this.unreadRefreshPromise = null;
+          this.currentRefreshChannel = null;
+        }
       });
       this.unreadRefreshPromise = promise;
       for (const listener of this.syncActivityListeners) {
@@ -589,7 +592,7 @@ class SlackRtm {
         for (const event of pendingCountEvents) {
           // A channel snapshot may already include messages received during HTTP sync.
           const snapshotLatest = this.countDetails[event.channel]?.snapshotLatest;
-          if (event.type === 'message' && !markedChannels.has(event.channel) && snapshotLatest &&
+          if (event.type === 'message' && isUnreadMessage(event) && !markedChannels.has(event.channel) && snapshotLatest &&
               compareTs(event.event_ts || event.ts, snapshotLatest) !== null &&
               compareTs(event.event_ts || event.ts, snapshotLatest) <= 0) {
             this.#applyMessageEvent(event, true);
@@ -621,7 +624,7 @@ class SlackRtm {
             const page = await send('users.conversations', { types: type, exclude_archived: true, limit: 200, cursor });
             if (!Array.isArray(page.channels)) throw new Error('チャンネル一覧が応答にありません');
             for (const channel of page.channels) {
-              if (channel.id && !channel.is_archived) channels.set(channel.id, { ...channel, is_im: type === 'im' || channel.is_im });
+              if (channel.id && !channel.is_archived) channels.set(channel.id, { ...channel, is_im: type === 'im' || channel.is_im, is_mpim: type === 'mpim' || Boolean(channel.is_mpim) });
             }
             cursor = typeof page.response_metadata?.next_cursor === 'string' ? page.response_metadata.next_cursor.trim() : '';
             if (cursor && seenCursors.has(cursor)) throw new Error('チャンネル一覧のページ取得が進みません');

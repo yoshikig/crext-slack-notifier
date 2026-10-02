@@ -637,6 +637,7 @@ test('deletions coalesce targeted HTTP refreshes and preserve other channels and
   remove('151');
   await f.flush();
   assert.deepEqual(targets, ['C1']);
+  assert.equal(f.client.currentRefreshChannel, 'C1');
   socket.onmessage({ data: JSON.stringify({ type: 'message', channel: 'C1', ts: '400', user: 'U2', text: '<@U1>' }) });
   complete({ channel: { id: 'C1', unread_count: 3, mention_count: 1, last_read: '100', latest: '350' } });
   await f.flush();
@@ -646,6 +647,7 @@ test('deletions coalesce targeted HTTP refreshes and preserve other channels and
   assert.equal(data.channels.find(c => c.id === 'C2').unreadCount, 8);
   assert.equal(data.lastUnreadSync.targetChannel, 'C1');
   assert.equal(data.lastUnreadSync.reason, 'message_deleted');
+  assert.equal(f.client.currentRefreshChannel, null);
   assert.equal(data.lastUnreadSync.status, 'success');
 });
 
@@ -697,4 +699,52 @@ test('deletion HTTP refresh uses history fallback and reports failures without t
   assert.equal(data.lastUnreadSync.status, 'error');
   assert.equal(data.channels.find(c => c.id === 'C1').unreadCount, 1);
   assert.match(data.channels.find(c => c.id === 'C1').countError, /HTTP再取得に失敗/);
+});
+
+test('queued edits update mention counts even when their event timestamp precedes snapshotLatest', async () => {
+  const f = await setup();
+  f.setCounts(async () => ({ channels: [{ id: 'C1', unread_count: 0, mention_count: 0, last_read: '100', latest: '100' }] }));
+  const socket = await f.open();
+  socket.onmessage({ data: JSON.stringify({ type: 'message', channel: 'C1', user: 'U2', ts: '200', text: 'hello' }) });
+  for (const [before, text, expected] of [[0, '<@U1>', 1], [1, 'hello again', 0]]) {
+    let finish;
+    f.setCounts(() => new Promise(resolve => { finish = resolve; }));
+    const refreshing = f.client.refresh();
+    const edit = { type: 'message', subtype: 'message_changed', channel: 'C1', ts: '250',
+      message: { type: 'message', user: 'U2', ts: '200', text } };
+    socket.onmessage({ data: JSON.stringify(edit) });
+    socket.onmessage({ data: JSON.stringify(edit) });
+    finish({ channels: [{ id: 'C1', unread_count: 1, mention_count: before, last_read: '100', latest: '300' }] });
+    await refreshing;
+    assert.equal(f.client.getDiagnostics().channels.find(c => c.id === 'C1').mentionCount, expected);
+  }
+});
+
+test('fallback MPIM type works when the API omits is_mpim and events omit channel_type', async () => {
+  const f = await setup();
+  f.setApiHandler(async (method, args) => {
+    if (method === 'rtm.connect') return { url: 'wss://example.invalid', self: { id: 'U1' } };
+    if (method === 'users.counts') throw 'Slack API error: not_allowed_token_type';
+    if (method === 'users.conversations') return { channels: args.types === 'mpim' ?
+      [{ id: 'G1', name: 'group-dm', unread_count: 0, mention_count: 0 }] : [] };
+    throw new Error(method);
+  });
+  const socket = await f.open();
+  socket.onmessage({ data: JSON.stringify({ type: 'message', channel: 'G1', user: 'U2', ts: '200', text: 'hello' }) });
+  const dm = f.client.getDiagnostics().channels.find(c => c.id === 'G1');
+  assert.equal(dm.unreadCount, 1);
+  assert.equal(dm.mentionCount, 1);
+});
+
+test('rich-text code-styled users and preformatted users are not mentions', async () => {
+  const f = await setup();
+  f.setCounts(async () => ({ channels: [{ id: 'C1', unread_count: 0, mention_count: 0 }] }));
+  const socket = await f.open();
+  socket.onmessage({ data: JSON.stringify({ type: 'message', channel: 'C1', user: 'U2', ts: '200',
+    blocks: [{ type: 'rich_text', elements: [
+      { type: 'rich_text_section', elements: [{ type: 'user', user_id: 'U1', style: { code: true } }] },
+      { type: 'rich_text_preformatted', elements: [{ type: 'user', user_id: 'U1' }] }
+    ] }] }) });
+  assert.equal(f.client.getDiagnostics().totals.mentionCount, 0);
+  assert.equal(f.client.getDiagnostics().totals.unreadCount, 1);
 });
