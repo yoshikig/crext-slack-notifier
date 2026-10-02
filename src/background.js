@@ -20,7 +20,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 
   if (changes.token) {
     clearGlobalValues();
-    keepWorkerAliveDuringSync(gSlackUnreadClient.restart());
+    gSlackUnreadClient.restart();
   }
 });
 
@@ -174,7 +174,7 @@ function keepWorkerAliveDuringSync(promise) {
 }
 
 chrome.alarms.onAlarm.addListener(alarm => {
-  if (alarm.name === 'refresh-unread-counts') keepWorkerAliveDuringSync(gSlackUnreadClient.refresh());
+  if (alarm.name === 'refresh-unread-counts') gSlackUnreadClient.refresh();
 });
 function setHttpSyncAlarm(policy) {
   chrome.alarms.create('refresh-unread-counts', { periodInMinutes: policy.intervalMinutes });
@@ -186,7 +186,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse(gSlackUnreadClient.getDiagnostics());
   }
   if (sender.id === chrome.runtime.id && message?.type === 'refreshUnreadCounts') {
-    keepWorkerAliveDuringSync(gSlackUnreadClient.refresh()).then(
+    gSlackUnreadClient.refresh().then(
       () => sendResponse(gSlackUnreadClient.getDiagnostics()),
       error => {
         console.error('Manual unread sync failed', error);
@@ -206,8 +206,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
+gSlackUnreadClient.addSyncActivityListener(promise => {
+  keepWorkerAliveDuringSync(promise).catch(error => console.error('Unread HTTP sync failed', error));
+});
 gSlackUnreadClient.addListener(updateUnreadCount);
 gSlackUnreadClient.initialize();
-keepWorkerAliveDuringSync(gSlackUnreadClient.start());
+gSlackUnreadClient.start();
 
 console.log('background.js loaded');

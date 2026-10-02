@@ -123,7 +123,7 @@ function renderDiagnostics(data) {
     ['再接続予定 / 試行回数', `${formatTime(c.nextReconnectAt)} / ${c.reconnectAttempt}`],
     ['接続エラー', c.error || 'なし'],
     ['未読データ同期', sync ? `${stateLabels[sync.status]} / 開始 ${formatTime(sync.startedAt)} / 完了 ${formatTime(sync.finishedAt)}` : '未実行'],
-    ['未読取得方法 / 進捗', sync ? `${sync.source || 'users.counts'}${sync.progress ? ` / ${sync.progress}` : ''}` : '—'],
+    ['未読取得方法 / 進捗', sync ? `${sync.source || 'users.counts'}${sync.targetChannel ? ` (${sync.targetChannel} / 削除後の再取得)` : ''}${sync.progress ? ` / ${sync.progress}` : ''}` : '—'],
     ['未読取得エラー・注意', sync?.error || sync?.warning || 'なし'],
     ['反映待ちイベント', `${data.pendingEvents}件`],
     ['表示取得時刻', formatTime(data.capturedAt)]
@@ -154,7 +154,7 @@ function renderDiagnostics(data) {
     });
   renderRows('channel-data', channels.map(c => [c.name || c.id, c.id,
     c.unreadCount === null ? '未取得' : `${c.unreadCount}${c.unreadCountExact === false ? '以上' : ''}`,
-    c.mentionCount === null ? '未取得' : c.mentionCount, c.muted ? 'はい' : 'いいえ', c.countError || '取得済み']),
+    c.mentionCount === null ? '未取得' : `${c.mentionCount}${c.mentionCountExact === false ? '（概算）' : ''}`, c.muted ? 'はい' : 'いいえ', c.countError || '取得済み']),
     6, !hasSuccessfulSync ? '未読データを取得できていません。同期ステータスの取得状況を確認してください。' :
       sync.status === 'partial' ? '未読データの取得が不完全です。Tokenの種類・権限を確認してください。' :
         unreadOnly ? '未読・メンションのあるチャンネルはありません' : '内部データはありません');
