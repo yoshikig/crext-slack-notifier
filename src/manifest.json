@@ -10,6 +10,6 @@
   },
   "options_page": "options.html",
   "action": { "default_icon": "slack.png" },
-  "permissions": ["notifications", "storage", "tabs"],
+  "permissions": ["notifications", "storage", "tabs", "alarms"],
   "host_permissions": ["http://*/", "https://*/"]
 }
