@@ -7,11 +7,11 @@ function save_options() {
   chrome.storage.sync.set({
     token: token
   }, () => {
-    document.getElementById('status').innerText = 'saved';
+    document.getElementById('status').textContent = '保存しました';
     saveCount++;
     setTimeout(((targetSaveCount) => {
       if(saveCount === targetSaveCount)
-        document.getElementById('status').innerText = '';
+        document.getElementById('status').textContent = '';
     }).bind(null, saveCount), 1000);
   });
 }
@@ -147,7 +147,11 @@ function renderDiagnostics(data) {
     `未読合計: ${countLabel(data.totals.unreadCount, data.totals.unreadIncomplete || !hasSuccessfulSync)} / メンション・DM合計: ${countLabel(data.totals.mentionCount, data.totals.mentionIncomplete || !hasSuccessfulSync)} / 保持チャンネル: ${data.channels.length}`;
   const unreadOnly = document.getElementById('unread-only').checked;
   const channels = data.channels.filter(c => !unreadOnly || c.unreadCount > 0 || c.mentionCount > 0 || c.unreadCount === null || c.mentionCount === null)
-    .sort((a, b) => b.unreadCount + b.mentionCount - a.unreadCount - a.mentionCount || a.id.localeCompare(b.id));
+    .sort((a, b) => {
+      const total = c => (c.unreadCount ?? 0) + (c.mentionCount ?? 0);
+      const priority = c => total(c) > 0 ? 2 : c.unreadCount === null || c.mentionCount === null ? 1 : 0;
+      return priority(b) - priority(a) || total(b) - total(a) || a.id.localeCompare(b.id);
+    });
   renderRows('channel-data', channels.map(c => [c.name || c.id, c.id,
     c.unreadCount === null ? '未取得' : `${c.unreadCount}${c.unreadCountExact === false ? '以上' : ''}`,
     c.mentionCount === null ? '未取得' : c.mentionCount, c.muted ? 'はい' : 'いいえ', c.countError || '取得済み']),

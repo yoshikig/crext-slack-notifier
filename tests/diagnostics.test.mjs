@@ -157,7 +157,7 @@ test('workspace details reuse team.info and discard the cache when the token cha
     });
   }, { context });
   const rtm = new vm.SyntheticModule(['default'], function() {
-    this.setExport('default', { addListener() {}, addSyncPolicyListener(fn) { policyListener = fn; }, getSyncPolicy() { return { intervalMinutes: 5 }; }, initialize() {}, start() {}, restart() {} });
+    this.setExport('default', { addListener() {}, addSyncPolicyListener(fn) { policyListener = fn; }, getSyncPolicy() { return { intervalMinutes: 5 }; }, initialize() {}, start() {}, restart() {}, refresh() { return Promise.reject(new Error('unexpected sync error')); }, getDiagnostics() { return { refreshing: false }; } });
   }, { context });
   const module = new vm.SourceTextModule(await readFile(new URL('../src/background.js', import.meta.url), 'utf8'), { context });
   await module.link(specifier => specifier === './slack_api.js' ? api : rtm);
@@ -166,6 +166,10 @@ test('workspace details reuse team.info and discard the cache when the token cha
   policyListener({ intervalMinutes: 30 });
   policyListener({ intervalMinutes: 5 });
   assert.deepEqual(alarmPeriods, [5, 30, 5]);
+  const failedSyncResponse = await new Promise(resolve => {
+    assert.equal(messageListener({ type: 'refreshUnreadCounts' }, { id: 'extension-id' }, resolve), true);
+  });
+  assert.equal(failedSyncResponse.refreshing, false);
   const requestInfo = () => new Promise(resolve => {
     assert.equal(messageListener({ type: 'getWorkspaceInfo' }, { id: 'extension-id' }, resolve), true);
   });
@@ -486,4 +490,32 @@ test('an HTTP sync begun before connection is excluded and followed by a fresh s
   assert.equal(f.client.getSyncPolicy().intervalMinutes, 5);
   socket.onmessage({ data: '{"type":"pong"}' });
   assert.equal(f.client.getSyncPolicy().intervalMinutes, 30);
+});
+
+test('history sync stops after five pages and distinguishes a lower bound from a complete count', async () => {
+  for (const hasMore of [true, false]) {
+    const f = await setup();
+    let pages = 0;
+    f.setApiHandler(async (method, args) => {
+      if (method === 'rtm.connect') throw 'Slack API error: not_allowed_token_type';
+      if (method === 'users.counts') throw 'Slack API error: not_allowed_token_type';
+      if (method === 'users.conversations') return { channels: args.types === 'public_channel' ? [{ id: 'C1' }] : [] };
+      if (method === 'conversations.info') return { channel: { id: 'C1', name: 'general', last_read: '100', latest: '1000' } };
+      if (method === 'conversations.history') {
+        pages += 1;
+        const more = pages < 5 || hasMore;
+        return { messages: [{ type: 'message', ts: String(1000 - pages) }], has_more: more,
+          response_metadata: { next_cursor: more ? 'page-' + pages : '' } };
+      }
+      throw new Error('unexpected API');
+    });
+    await f.client.start();
+    const data = f.client.getDiagnostics();
+    assert.equal(pages, 5);
+    assert.equal(data.channels[0].unreadCount, 5);
+    assert.equal(data.channels[0].unreadCountExact, !hasMore);
+    assert.equal(data.lastUnreadSync.status, hasMore ? 'partial' : 'success');
+    assert.equal(data.totals.unreadIncomplete, hasMore);
+    if (hasMore) assert.match(data.lastUnreadSync.warning, /履歴取得上限/);
+  }
 });

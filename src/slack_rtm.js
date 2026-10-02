@@ -3,6 +3,7 @@ import { send, getSyncHistory } from "./slack_api.js";
 let theInstance = null;
 const stableConnectionMs = 11 * 60 * 1000;
 const pongTimeoutMs = 60 * 1000;
+const maxHistoryPages = 5;
 const ignoredMessageSubtypes = new Set(['message_changed', 'message_deleted', 'message_replied',
   'channel_join', 'channel_leave', 'group_join', 'group_leave', 'channel_topic', 'channel_purpose',
   'channel_name', 'group_topic', 'group_purpose', 'group_name']);
@@ -366,7 +367,7 @@ class SlackRtm {
         for (const channel of entries) {
           if (!channel.id || channel.is_archived) continue;
           let unread = numericCount(channel.unread_count_display, channel.unread_count, channel.is_im ? channel.dm_count : null);
-          let exact = true;
+          let exact = channel.unreadCountExact !== false;
           if (unread === null && typeof channel.has_unreads === 'boolean') {
             unread = channel.has_unreads ? 1 : 0;
             exact = !channel.has_unreads;
@@ -470,6 +471,11 @@ class SlackRtm {
               if (history) {
                 info.unread_count = history.count;
                 info.snapshotLatest = history.snapshotLatest;
+                info.unreadCountExact = history.exact;
+                if (!history.exact) {
+                  info.countError = '履歴取得上限（5ページ）に達したため、未読数は下限値です';
+                  warnings.push(`${id}: 履歴取得上限に到達（未読${history.count}件以上）`);
+                }
               }
             }
           }
@@ -491,6 +497,7 @@ class SlackRtm {
       let latest = upperBound;
       let count = 0;
       const seenPages = new Set();
+      let pages = 0;
       do {
         if (refreshId !== this.unreadRefreshId) return null;
         const args = { channel, oldest: lastRead, inclusive: false, limit: 200, cursor };
@@ -503,8 +510,12 @@ class SlackRtm {
         const pageKey = cursor || (page.has_more ? latest : undefined);
         if ((page.has_more && !pageKey) || (pageKey && seenPages.has(pageKey))) throw new Error('未読履歴のページ取得が進みません');
         if (pageKey) seenPages.add(pageKey);
+        pages += 1;
+        if (pages >= maxHistoryPages && (cursor || page.has_more)) {
+          return { count, snapshotLatest, exact: false };
+        }
       } while (cursor || latest);
-      return { count, snapshotLatest };
+      return { count, snapshotLatest, exact: true };
     }
 
     #scheduleReconnect() {

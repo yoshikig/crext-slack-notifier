@@ -186,7 +186,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse(gSlackUnreadClient.getDiagnostics());
   }
   if (sender.id === chrome.runtime.id && message?.type === 'refreshUnreadCounts') {
-    keepWorkerAliveDuringSync(gSlackUnreadClient.refresh()).then(() => sendResponse(gSlackUnreadClient.getDiagnostics()));
+    keepWorkerAliveDuringSync(gSlackUnreadClient.refresh()).then(
+      () => sendResponse(gSlackUnreadClient.getDiagnostics()),
+      error => {
+        console.error('Manual unread sync failed', error);
+        sendResponse(gSlackUnreadClient.getDiagnostics());
+      }
+    );
     return true;
   }
   if (sender.id === chrome.runtime.id && message?.type === 'getWorkspaceInfo') {
